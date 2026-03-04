@@ -17,7 +17,7 @@
  *           USART1 PA10 = RX ← TX LoRa-E5
  *           Baudrate LoRa-E5 : 9600 baud (défaut firmware)
  *
- * @version 1.0.0
+ * @version 0.9.2
  * @date    2026-02-26
  * @copyright Copyright (c) 2026 manu — Licence MIT
  *******************************************************************************

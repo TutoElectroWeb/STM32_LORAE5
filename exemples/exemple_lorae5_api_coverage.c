@@ -215,6 +215,9 @@ static void LoraCoverage_AppInit(void)
     Error_Handler();
   }
 
+  /* GetVersionString : version lib au démarrage */
+  printf("[COV] LORAE5 lib v%s\r\n", LORAE5_GetVersionString());
+
   /* SetRegion + Join : couverts ici, erreur attendue si pas de clés */
   LORAE5_Status st = LORAE5_SetRegion(&hlorae5, LORAE5_APP_REGION);
   printf("[COV] LORAE5_SetRegion  -> %s\r\n", LORAE5_StatusToString(st));
@@ -229,7 +232,7 @@ static void LoraCoverage_AppInit(void)
   sendmsg_done = 0U;
   overflow_clear_done = 0U;
 
-  printf("[COV] cible: SetRegion, Join, StatusToString, SetLineCallback, SendRaw, Reset, StartManagedOtaa, IsJoined, SendMsg, SendMsgHex, GetOverflowCount, ClearOverflowCount\r\n");
+  printf("[COV] cible: SetRegion, Join, StatusToString, SetLineCallback, SendRaw, Reset, StartManagedOtaa, IsJoined, SendMsg, SendMsgHex, GetOverflowCount, ClearOverflowCount, GetVersionString\r\n");
 }
 
 static void LoraCoverage_AppTask(void)

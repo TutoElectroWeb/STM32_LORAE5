@@ -1,6 +1,6 @@
 # STM32_LORAE5 — Driver AT LoRa-E5 via UART + DMA
 
-Version : **v1.0.0** — Licence : MIT
+Version : **v0.9.2** — Licence : MIT
 
 ---
 

@@ -191,13 +191,19 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 static void LoraTestTx_AppInit(void)
 {
-  if (LORAE5_Init(&hlorae5, &huart1, lora_rx_dma, sizeof(lora_rx_dma)) != LORAE5_OK)
+  LORAE5_Status st;
+
+  st = LORAE5_Init(&hlorae5, &huart1, lora_rx_dma, sizeof(lora_rx_dma));
+  if (st != LORAE5_OK)
   {
+    printf("ERREUR: LORAE5_Init -> %s\r\n", LORAE5_StatusToString(st));
     Error_Handler();
   }
 
-  if (LORAE5_StartRx(&hlorae5) != LORAE5_OK)
+  st = LORAE5_StartRx(&hlorae5);
+  if (st != LORAE5_OK)
   {
+    printf("ERREUR: LORAE5_StartRx -> %s\r\n", LORAE5_StatusToString(st));
     Error_Handler();
   }
 

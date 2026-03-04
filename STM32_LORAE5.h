@@ -4,8 +4,8 @@
  * @author  manu
  * @brief   Driver AT-command pour module LoRa-E5 (Wio-E5 / STM32WLE5)
  *          via UART + DMA circulaire RX.
- * @version 1.0.0
- * @date    2026-02-26
+ * @version 0.9.2
+ * @date    2026-03-04
  * @copyright Libre sous licence MIT.
  * @note    Délais bloquants : aucun — toutes les opérations sont non-bloquantes.
  *          Les timeouts applicatifs sont gérés dans LORAE5_Task() via HAL_GetTick().
@@ -39,11 +39,11 @@ extern "C" {
  * ============================================================================ */
 
 /** @brief Version majeure de la librairie STM32_LORAE5. */
-#define LORAE5_LIB_VERSION_MAJOR  1U  ///< Majeur : incrémenté sur rupture d'API
+#define LORAE5_LIB_VERSION_MAJOR  0U  ///< Majeur : incrémenté sur rupture d'API
 /** @brief Version mineure de la librairie STM32_LORAE5. */
-#define LORAE5_LIB_VERSION_MINOR  0U  ///< Mineur : incrémenté sur fonctionnalité compatible
+#define LORAE5_LIB_VERSION_MINOR  9U  ///< Mineur : incrémenté sur fonctionnalité compatible
 /** @brief Version patch de la librairie STM32_LORAE5. */
-#define LORAE5_LIB_VERSION_PATCH  0U  ///< Patch : corrections rétrocompatibles
+#define LORAE5_LIB_VERSION_PATCH  2U  ///< Patch : corrections rétrocompatibles
 
 /* ============================================================================
  * Exported types
@@ -112,6 +112,10 @@ typedef struct {
 
   /* ── Événements downlink LoRaWAN ─────────────────────────────────────── */
   volatile bool evt_downlink;              ///< true si un downlink a été reçu (consommer via ConsumeDownlinkEvent)
+  /* downlink_port / downlink_data / downlink_is_hex : écrits depuis ISR (lorae5_parse_downlink)
+   * mais non-volatile intentionnellement — strncpy/memcpy ne supporte pas volatile char*.
+   * La protection est assurée par : __DMB() côté ISR avant evt_downlink, et
+   * __disable_irq() côté main (ConsumeDownlinkEvent) qui agit comme barrière compilateur (CPSID+memory). */
   uint8_t downlink_port;                   ///< Port applicatif du dernier downlink (1..223)
   char downlink_data[LORAE5_RX_LINE_MAX];  ///< Payload du downlink (ASCII ou hex string selon +MSG/+MSGHEX)
   bool downlink_is_hex;                    ///< true si le downlink provient d'un +MSGHEX: (payload hex)
@@ -354,63 +358,8 @@ LORAE5_Status LORAE5_SendMsg(LORAE5_Handle_t *handle, const char *payload_ascii,
  */
 LORAE5_Status LORAE5_SendMsgHex(LORAE5_Handle_t *handle, const char *payload_hex, bool confirmed);
 
-/* ── Machine d'état OTAA managée ─────────────────────────────────────────── */
-
-/**
- * @brief  Démarre la machine d'état OTAA managée (clés depuis STM32_LORAE5_conf.h).
- * @param  handle            Handle actif (non NULL)
- * @param  region            Région LoRaWAN (non NULL, ex : "EU868")
- * @param  periodic_payload  Payload uplink périodique (non NULL)
- * @param  uplink_period_ms  Période uplink en ms (> 0)
- * @param  startup_delay_ms  Délai initial avant la première action AT (ms)
- * @retval LORAE5_OK          Démarrage réussi
- * @retval LORAE5_ERR_NULL_PTR    Paramètre NULL
- * @retval LORAE5_ERR_ARG     uplink_period_ms == 0
- * @note   Les clés DevEUI/AppEUI/AppKey sont lues depuis STM32_LORAE5_conf.h
- *         (LORAE5_APP_DEV_EUI, LORAE5_APP_APP_EUI, LORAE5_APP_APP_KEY).
- * @note   Appeler LORAE5_Task() périodiquement depuis la boucle principale.
- */
-LORAE5_Status LORAE5_StartManagedOtaa(LORAE5_Handle_t *handle,
-                                      const char *region,
-                                      const char *periodic_payload,
-                                      uint32_t uplink_period_ms,
-                                      uint32_t startup_delay_ms);
-
-/**
- * @brief  Démarre la machine d'état OTAA managée avec clés explicites.
- * @param  handle            Handle actif (non NULL)
- * @param  region            Région LoRaWAN (non NULL)
- * @param  periodic_payload  Payload uplink périodique (non NULL)
- * @param  uplink_period_ms  Période uplink en ms (> 0)
- * @param  startup_delay_ms  Délai initial en ms
- * @param  dev_eui           DevEUI 16 hex chars ou NULL (utilisation de la valeur du module)
- * @param  app_eui           AppEUI 16 hex chars ou NULL
- * @param  app_key           AppKey 32 hex chars ou NULL
- * @retval LORAE5_OK          Démarrage réussi
- * @retval LORAE5_ERR_NULL_PTR    Paramètre obligatoire NULL
- * @retval LORAE5_ERR_ARG     Format clé invalide ou uplink_period_ms == 0
- * @note   Appeler LORAE5_Task() périodiquement depuis la boucle principale.
- */
-LORAE5_Status LORAE5_StartManagedOtaaWithKeys(LORAE5_Handle_t *handle,
-                                              const char *region,
-                                              const char *periodic_payload,
-                                              uint32_t uplink_period_ms,
-                                              uint32_t startup_delay_ms,
-                                              const char *dev_eui,
-                                              const char *app_eui,
-                                              const char *app_key);
-
-/**
- * @brief  Avance la machine d'état OTAA managée — appeler depuis while(1).
- * @param  handle  Handle actif (ignoré si NULL ou managed_enabled == false)
- * @param  now_ms  Valeur courante de HAL_GetTick()
- * @pre    LORAE5_StartManagedOtaa* doit avoir été appelé.
- * @pre    now_ms doit être HAL_GetTick() (monotone, non réinitialisé).
- * @note   Non-bloquant. Gère automatiquement : ping, version, mode, région,
- *         injection des clés (si fournies), join, uplink périodique et retry.
- * @note   Timer anti-wraparound : utilise `(int32_t)(now_ms - target) >= 0`.
- */
-void LORAE5_Task(LORAE5_Handle_t *handle, uint32_t now_ms);
+/* ── File RX et événements LoRaWAN ───────────────────────────────────────── */
+/* @note  La FSM OTAA managée (StartManagedOtaa*, Task) est dans STM32_LORAE5_gateway.h */
 
 /**
  * @brief  Dépile une ligne RX depuis le buffer partagé (section critique interne).
@@ -518,6 +467,15 @@ void LORAE5_TerminalTask(LORAE5_Terminal *term);
  * @note   Toujours disponible — pas de compilation conditionnelle.
  */
 const char *LORAE5_StatusToString(LORAE5_Status status);
+
+/**
+ * @brief  Retourne la version de la librairie sous forme de chaîne (ex : "1.0.0").
+ * @retval Pointeur vers une chaîne littérale statique (ne pas libérer)
+ * @note   Complément runtime des macros LORAE5_LIB_VERSION_MAJOR/MINOR/PATCH.
+ *         Utile pour logger la version au démarrage :
+ *         printf("LORAE5 v%s\r\n", LORAE5_GetVersionString());
+ */
+const char *LORAE5_GetVersionString(void);
 
 /**
  * @brief  Retourne le nombre de lignes RX perdues par overflow de queue.

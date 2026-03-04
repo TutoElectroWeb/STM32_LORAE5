@@ -3,8 +3,8 @@
  * @file    STM32_LORAE5.c
  * @author  manu
  * @brief   Implémentation du driver AT-command STM32_LORAE5.
- * @version 1.0.0
- * @date    2026-02-26
+ * @version 0.9.2
+ * @date    2026-03-04
  * @copyright Libre sous licence MIT.
  *******************************************************************************
  */
@@ -27,6 +27,10 @@
 #  define LORAE5_LOG(fmt, ...) ((void)0)
 #endif
 
+/* Stringification des macros numériques pour LORAE5_GetVersionString() */
+#define LORAE5_STR(x)  #x
+#define LORAE5_XSTR(x) LORAE5_STR(x)
+
 /* ============================================================================
  * Private function prototypes
  * ============================================================================ */
@@ -34,9 +38,6 @@ static LORAE5_Status lorae5_send_fmt(LORAE5_Handle_t *handle, const char *fmt_rn
 static void lorae5_feed_char(LORAE5_Handle_t *handle, char ch);
 static void lorae5_emit_line(LORAE5_Handle_t *handle);
 static bool lorae5_line_contains(const char *line, const char *token);
-static bool lorae5_is_non_empty(const char *s);
-static bool lorae5_is_hex_char(char c);
-static bool lorae5_is_hex_string_exact(const char *s, size_t expected_len);
 static void lorae5_term_write(UART_HandleTypeDef *uart, const char *s);
 static void lorae5_parse_downlink(LORAE5_Handle_t *handle, const char *line, bool is_hex);
 
@@ -67,7 +68,9 @@ LORAE5_Status LORAE5_DeInit(LORAE5_Handle_t *handle) {
   }
 
   if (handle->huart != NULL) {
-    (void)HAL_UART_DMAStop(handle->huart);
+    if (HAL_UART_DMAStop(handle->huart) != HAL_OK) {
+      handle->last_error = LORAE5_ERR_UART; /* arrêt DMA non bloquant en DeInit */
+    }
   }
 
   memset(handle, 0, sizeof(*handle));
@@ -276,202 +279,6 @@ LORAE5_Status LORAE5_SendMsgHex(LORAE5_Handle_t *handle, const char *payload_hex
   return lorae5_send_fmt(handle, "AT+MSGHEX=\"%s\"\r\n", payload_hex);
 }
 
-LORAE5_Status LORAE5_StartManagedOtaa(LORAE5_Handle_t *handle,
-                                      const char *region,
-                                      const char *periodic_payload,
-                                      uint32_t uplink_period_ms,
-                                      uint32_t startup_delay_ms) {
-  return LORAE5_StartManagedOtaaWithKeys(handle,
-                                         region,
-                                         periodic_payload,
-                                         uplink_period_ms,
-                                         startup_delay_ms,
-                                         LORAE5_APP_DEV_EUI,
-                                         LORAE5_APP_APP_EUI,
-                                         LORAE5_APP_APP_KEY);
-}
-
-LORAE5_Status LORAE5_StartManagedOtaaWithKeys(LORAE5_Handle_t *handle,
-                                              const char *region,
-                                              const char *periodic_payload,
-                                              uint32_t uplink_period_ms,
-                                              uint32_t startup_delay_ms,
-                                              const char *dev_eui,
-                                              const char *app_eui,
-                                              const char *app_key) {
-  if ((handle == NULL) || (region == NULL) || (periodic_payload == NULL)) {
-    return LORAE5_ERR_NULL_PTR;
-  }
-
-  if (uplink_period_ms == 0U) {
-    return LORAE5_ERR_ARG;
-  }
-
-  if (lorae5_is_non_empty(dev_eui) && !lorae5_is_hex_string_exact(dev_eui, 16U)) {
-    return LORAE5_ERR_ARG;
-  }
-
-  if (lorae5_is_non_empty(app_eui) && !lorae5_is_hex_string_exact(app_eui, 16U)) {
-    return LORAE5_ERR_ARG;
-  }
-
-  if (lorae5_is_non_empty(app_key) && !lorae5_is_hex_string_exact(app_key, 32U)) {
-    return LORAE5_ERR_ARG;
-  }
-
-  handle->managed_enabled = true;
-  handle->managed_region = region;
-  handle->managed_payload = periodic_payload;
-  handle->managed_dev_eui = dev_eui;
-  handle->managed_app_eui = app_eui;
-  handle->managed_app_key = app_key;
-  handle->managed_uplink_period_ms = uplink_period_ms;
-  /* L'addition peut déborder uint32_t si HAL_GetTick() est proche de UINT32_MAX.
-   * C'est intentionnel : la comparaison FSM utilise (int32_t)(now_ms - target) >= 0,
-   * qui gère correctement le wraparound en arithmétique modulaire 2^32. */
-  handle->managed_next_action_ms = HAL_GetTick() + startup_delay_ms;
-  handle->managed_last_uplink_ms = 0U;
-  handle->managed_step = 0U;
-  handle->joined = false;
-  handle->evt_join_ok = false;
-  handle->evt_join_fail = false;
-
-  return LORAE5_OK;
-}
-
-void LORAE5_Task(LORAE5_Handle_t *handle, uint32_t now_ms) {
-  bool snap_join_ok;
-  bool snap_join_fail;
-
-  if ((handle == NULL) || (!handle->managed_enabled)) {
-    return;
-  }
-
-  /* Snapshot atomique des flags volatils posés depuis ISR.
-   * Lecture protégée par section critique courte (Cortex-M0 : bool non atomique).
-   * Les flags ne sont pas remis à zéro ici — c'est le rôle de Consume*Event(). */
-  __disable_irq();
-  snap_join_ok   = handle->evt_join_ok;
-  snap_join_fail = handle->evt_join_fail;
-  __enable_irq();
-
-  /* Watchdog JOIN : si AT+JOIN n'a pas reçu de réponse dans LORAE5_JOIN_TIMEOUT_MS,
-   * forcer un retry sans attendre evt_join_fail (module silencieux, perte UART…). */
-  if ((handle->managed_step == 8U) &&
-      (!handle->joined) &&
-      (handle->managed_join_deadline_ms != 0U) &&
-      ((int32_t)(now_ms - handle->managed_join_deadline_ms) >= 0)) {
-    handle->managed_join_deadline_ms = 0U;
-    handle->managed_step             = 7U;
-    handle->managed_next_action_ms   = now_ms + LORAE5_JOIN_RETRY_DELAY_MS;
-  }
-
-  if (snap_join_fail && !snap_join_ok) {
-    handle->joined                   = false;
-    handle->managed_join_deadline_ms = 0U;
-    handle->managed_step             = 7U;
-    handle->managed_next_action_ms   = now_ms + 5000U;
-  }
-
-  if (snap_join_ok) {
-    handle->joined                   = true;
-    handle->managed_join_deadline_ms = 0U;  /* watchdog désarmé */
-    handle->managed_step             = 8U;
-  }
-
-  if ((int32_t)(now_ms - handle->managed_next_action_ms) >= 0) {
-    switch (handle->managed_step) {
-    case 0:
-      if (LORAE5_Ping(handle) == LORAE5_OK) {
-        handle->managed_step = 1U;
-        handle->managed_next_action_ms = now_ms + 300U;
-      }
-      break;
-
-    case 1:
-      if (LORAE5_GetVersion(handle) == LORAE5_OK) {
-        handle->managed_step = 2U;
-        handle->managed_next_action_ms = now_ms + 300U;
-      }
-      break;
-
-    case 2:
-      if (LORAE5_SetMode(handle, LORAE5_MODE_LWOTAA) == LORAE5_OK) {
-        handle->managed_step = 3U;
-        handle->managed_next_action_ms = now_ms + 300U;
-      }
-      break;
-
-    case 3:
-      if (LORAE5_SetRegion(handle, handle->managed_region) == LORAE5_OK) {
-        if (lorae5_is_non_empty(handle->managed_dev_eui)) {
-          handle->managed_step = 4U;
-        } else if (lorae5_is_non_empty(handle->managed_app_eui)) {
-          handle->managed_step = 5U;
-        } else if (lorae5_is_non_empty(handle->managed_app_key)) {
-          handle->managed_step = 6U;
-        } else {
-          handle->managed_step = 7U;
-        }
-        handle->managed_next_action_ms = now_ms + 500U;
-      }
-      break;
-
-    case 4:
-      if (lorae5_send_fmt(handle, "AT+ID=DevEui,\"%s\"\r\n", handle->managed_dev_eui) == LORAE5_OK) {
-        if (lorae5_is_non_empty(handle->managed_app_eui)) {
-          handle->managed_step = 5U;
-        } else if (lorae5_is_non_empty(handle->managed_app_key)) {
-          handle->managed_step = 6U;
-        } else {
-          handle->managed_step = 7U;
-        }
-        handle->managed_next_action_ms = now_ms + 500U;
-      }
-      break;
-
-    case 5:
-      if (lorae5_send_fmt(handle, "AT+ID=AppEui,\"%s\"\r\n", handle->managed_app_eui) == LORAE5_OK) {
-        if (lorae5_is_non_empty(handle->managed_app_key)) {
-          handle->managed_step = 6U;
-        } else {
-          handle->managed_step = 7U;
-        }
-        handle->managed_next_action_ms = now_ms + 500U;
-      }
-      break;
-
-    case 6:
-      if (lorae5_send_fmt(handle, "AT+KEY=APPKEY,\"%s\"\r\n", handle->managed_app_key) == LORAE5_OK) {
-        handle->managed_step = 7U;
-        handle->managed_next_action_ms = now_ms + 500U;
-      }
-      break;
-
-    case 7:
-      if (LORAE5_Join(handle) == LORAE5_OK) {
-        handle->managed_step              = 8U;
-        handle->managed_next_action_ms    = now_ms + 10000U;           /* wraparound intentionnel — voir comparaison (int32_t) ci-dessus */
-        handle->managed_join_deadline_ms  = now_ms + LORAE5_JOIN_TIMEOUT_MS; /* idem */
-      }
-      break;
-
-    default:
-      break;
-    }
-  }
-
-  if (handle->joined) {
-    /* Soustraction uint32_t modulo 2^32 : correcte pour elapsed >= period (anti-wraparound implicite).
-     * Différent des comparaisons de deadline FSM (cast int32_t) car ici period_ms <= 2^31. */
-    if ((now_ms - handle->managed_last_uplink_ms) >= handle->managed_uplink_period_ms) {
-      if (LORAE5_SendMsg(handle, handle->managed_payload, false) == LORAE5_OK) {
-        handle->managed_last_uplink_ms = now_ms;
-      }
-    }
-  }
-}
-
 bool LORAE5_PopLine(LORAE5_Handle_t *handle, char *out, size_t out_size) {
   bool has_line;
 
@@ -603,34 +410,42 @@ void LORAE5_TerminalRxCallback(LORAE5_Terminal *term, UART_HandleTypeDef *huart)
     if (term->cmd_len > 0U) {
       term->cmd_buf[term->cmd_len] = '\0';
       term->cmd_ready = true;
+      if (term->echo) {
+        if (HAL_UART_Transmit(term->uart_debug, (uint8_t *)"\r\n", 2U, LORAE5_TERM_TX_TIMEOUT_MS) != HAL_OK) { /* echo best-effort */ }
+      }
     }
   } else if ((ch == 0x08U) || (ch == 0x7FU)) {
     if (term->cmd_len > 0U) {
       term->cmd_len--;
+      if (term->echo) {
+        /* érase caractère : backspace + espace + backspace */
+        uint8_t bseq[3] = {0x08U, (uint8_t)' ', 0x08U};
+        if (HAL_UART_Transmit(term->uart_debug, bseq, 3U, LORAE5_TERM_TX_TIMEOUT_MS) != HAL_OK) { /* echo best-effort */ }
+      }
     }
   } else {
     if (term->cmd_len < (uint16_t)(LORAE5_TERM_CMD_MAX - 1U)) {
       term->cmd_buf[term->cmd_len++] = (char)ch;
       term->last_input_ms = HAL_GetTick();
+      if (term->echo) {
+        if (HAL_UART_Transmit(term->uart_debug, &term->rx_char, 1U, LORAE5_TERM_TX_TIMEOUT_MS) != HAL_OK) { /* echo best-effort */ }
+      }
     } else {
       term->cmd_buf[term->cmd_len] = '\0';
       term->cmd_ready = true;
     }
   }
 
-  (void)HAL_UART_Receive_IT(term->uart_debug, &term->rx_char, 1U); /* terminal: relance RX IT après chaque octet */
+  if (HAL_UART_Receive_IT(term->uart_debug, &term->rx_char, 1U) != HAL_OK) { /* relance RX IT : échec = terminal hors service jusqu'au prochain reset */ }
 }
 
 void LORAE5_TerminalTask(LORAE5_Terminal *term) {
   char line[LORAE5_RX_LINE_MAX];
-  uint32_t now_ms;
   LORAE5_Status st;
 
   if ((term == NULL) || (term->lora == NULL) || (term->uart_debug == NULL)) {
     return;
   }
-
-  now_ms = HAL_GetTick();
 
   if (term->show_prompt && (!term->prompt_displayed) && (!term->cmd_ready) && (term->cmd_len == 0U)) {
     lorae5_term_write(term->uart_debug, "[LORA-TERM] === Entrez une commande AT : ");
@@ -638,12 +453,15 @@ void LORAE5_TerminalTask(LORAE5_Terminal *term) {
   }
 
 #if (LORAE5_TERM_AUTOSEND_IDLE_MS > 0U)
+  {
+  uint32_t now_ms = HAL_GetTick();
   if ((!term->cmd_ready) && (term->cmd_len > 0U)) {
     if ((uint32_t)(now_ms - term->last_input_ms) >= LORAE5_TERM_AUTOSEND_IDLE_MS) {
       term->cmd_buf[term->cmd_len] = '\0';
       term->cmd_ready = true;
       lorae5_term_write(term->uart_debug, "\r\n");
     }
+  }
   }
 #endif
 
@@ -749,10 +567,12 @@ static void lorae5_emit_line(LORAE5_Handle_t *handle) {
         lorae5_line_contains(handle->line_buf, "+JOIN: Done") ||
         lorae5_line_contains(handle->line_buf, "+JOIN: Joined already")) {
       handle->joined = true;
-      handle->evt_join_ok = true;
       handle->evt_join_fail = false;
+      __DMB();  /* barrière mémoire : joined visible avant evt_join_ok côté main (symétrie avec downlink) */
+      handle->evt_join_ok = true;
     } else if (lorae5_line_contains(handle->line_buf, "+JOIN: Join failed")) {
       handle->joined = false;
+      __DMB();  /* barrière mémoire : joined visible avant evt_join_fail côté main */
       handle->evt_join_fail = true;
     }
 
@@ -778,35 +598,6 @@ static bool lorae5_line_contains(const char *line, const char *token) {
   }
 
   return (strstr(line, token) != NULL);
-}
-
-static bool lorae5_is_non_empty(const char *s) {
-  return (s != NULL) && (s[0] != '\0');
-}
-
-static bool lorae5_is_hex_char(char c) {
-  return ((c >= '0') && (c <= '9')) || ((c >= 'a') && (c <= 'f')) || ((c >= 'A') && (c <= 'F'));
-}
-
-static bool lorae5_is_hex_string_exact(const char *s, size_t expected_len) {
-  size_t len;
-
-  if (s == NULL) {
-    return false;
-  }
-
-  len = strlen(s);
-  if (len != expected_len) {
-    return false;
-  }
-
-  for (size_t i = 0U; i < len; i++) {
-    if (!lorae5_is_hex_char(s[i])) {
-      return false;
-    }
-  }
-
-  return true;
 }
 
 static void lorae5_term_write(UART_HandleTypeDef *uart, const char *s) {
@@ -901,6 +692,12 @@ void LORAE5_ClearOverflowCount(LORAE5_Handle_t *handle) {
   handle->rx_overflow_count = 0U;
 }
 
+const char *LORAE5_GetVersionString(void) {
+  return LORAE5_XSTR(LORAE5_LIB_VERSION_MAJOR) "." \
+         LORAE5_XSTR(LORAE5_LIB_VERSION_MINOR) "." \
+         LORAE5_XSTR(LORAE5_LIB_VERSION_PATCH);
+}
+
 const char *LORAE5_StatusToString(LORAE5_Status status) {
   switch (status) {
   case LORAE5_OK:
@@ -918,7 +715,6 @@ const char *LORAE5_StatusToString(LORAE5_Status status) {
   case LORAE5_ERR_OVERFLOW:
     return "LORAE5_ERR_OVERFLOW";
   default:
-    break;
+    return "LORAE5_ERR_UNKNOWN";
   }
-  (void)status; return "";
 }
